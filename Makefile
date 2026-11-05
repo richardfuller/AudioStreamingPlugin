@@ -4,14 +4,8 @@ ID      := audio-stream
 
 all: dist/$(ID)-module.tar.gz
 
-build/arm/$(ID).so: src/audio_stream.c
-	@mkdir -p build/arm
-	$(CC_ARM) $(CFLAGS) -shared -o $@ $< -lpthread
-
-dist/$(ID)-module.tar.gz: build/arm/$(ID).so module.json
-	@mkdir -p dist/$(ID)
-	cp build/arm/$(ID).so module.json dist/$(ID)/
-	tar -C dist -czf $@ $(ID)
+dist/$(ID)-module.tar.gz: src/audio_stream.c module.json scripts/build.py scripts/package.py
+	python3 scripts/build.py
 
 build/host/$(ID).so: src/audio_stream.c
 	@mkdir -p build/host
