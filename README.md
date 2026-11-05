@@ -41,6 +41,16 @@ stepped, the level follows the knob, and at volume 0 nothing can be recovered. T
 polling `GET /status` and watch `level_1s.peak_in` (the raw tap level, before this module's gain). Workarounds:
 set **Gain** to compensate for a fixed knob position, or keep the knob where you want the stream level.
 
+**Suggested starting point: Gain −6 dB, Limit On.** On a Move the Mix tap was measured already at full scale
+(roughly 150–240 clipped samples per second); −6 dB gives the limiter room and avoids adding more, but it cannot
+un-flatten peaks that were clamped inside Schwung. The meter in `/status` (`peak_in`, `peak_out`, `limited_samples`)
+applies the same gain and limiter whether or not anyone is listening, so you can tune it with no player attached.
+
+**Reading a knob sweep** (poll `/status`, note `level_1s.peak_in` at each knob position; see `docs/NOTES.md`):
+`peak_in` *rising* as the knob goes down means the divide-by-volume path is active (and it hard-clamps);
+`peak_in` flat but already at 1.0 means the Link Audio sum is overloading before the tap; `peak_in` *falling* with the
+knob means the shim's volume value is stale or stepped.
+
 Caveats:
 - **Unverified on a device:** the Mix source was built from Schwung's source and tested against a fake ring only.
 - With no Schwung slot loaded, Schwung un-scales Move's output by 1/master-volume (max 50×) for this ring, so very low
@@ -71,6 +81,9 @@ Config JSON (module config): `port`, `port_span` (default 16), `stall_ms` (defau
 - Quiet when idle: with no listener the worker sleeps in `poll()` (100 ms housekeeping), at `nice 10`, off core 3. Only streaming wakes it every 5 ms.
 - Diagnostics go to Schwung Manager → System → Logs (prefix `[audio-stream]`): bind result, source, client connect/drop, rebinds. None are written from the audio thread.
 - The audio thread only copies samples into a lock-free ring; networking runs on a demoted worker thread off core 3.
+
+`move.local` relies on mDNS and can fail to resolve, and the Move's address can change (DHCP). If a player or
+`curl` cannot find it, use the Move's IP, or give it a DHCP reservation.
 
 ## Diagnostics without SSH
 ```

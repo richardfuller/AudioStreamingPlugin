@@ -411,10 +411,26 @@ static void test_gain_and_limiter(void)
     api->set_param(inst, "limiter", "0");
     p = measure_peak(inst, 20000);
     CHECK(p == 32767, "+12 dB with limiter off clips (got %d)", p);
-    static char b[16384];
+    static char b[16384], b2[16384];
     http_get_all(18970, "/status", b, sizeof b);
     CHECK(strstr(b, "\"gain_db\":12") && strstr(b, "\"limiter\":0") && strstr(b, "\"clipped_in_total\":"), "status gain fields");
     PASS("stream gain is exact; soft limiter prevents clipping; clip counters exposed");
+
+    /* Idle meter honesty: no client connected, full-scale input, limiter on, 0 dB. */
+    api->set_param(inst, "gain", "0");
+    api->set_param(inst, "limiter", "1");
+    int16_t blk[256];
+    for (int b = 0; b < 800; b++) {
+        for (int i = 0; i < 128; i++) { int16_t v = (int16_t)(((b * 128 + i) / 50) % 2 ? 32767 : -32768); blk[i*2] = v; blk[i*2+1] = v; }
+        api->process_block(inst, blk, 128);
+        usleep(2900);
+    }
+    CHECK(get_int(inst, "clients") == 0, "a client is attached");
+    http_get_all(18970, "/status", b2, sizeof b2);
+    CHECK(strstr(b2, "\"peak_in\":1.0000"), "idle peak_in: %s", strstr(b2, "level_1s"));
+    CHECK(!strstr(b2, "\"peak_out\":1.0000") && strstr(b2, "\"peak_out\":0.9"), "idle peak_out must reflect the limiter: %s", strstr(b2, "level_1s"));
+    CHECK(!strstr(b2, "\"limited_samples\":0}"), "idle limited_samples is 0: %s", strstr(b2, "level_1s"));
+    PASS("idle meter applies the same gain+limiter (peak_out/limited_samples honest with no listener)");
     api->destroy_instance(inst);
 }
 

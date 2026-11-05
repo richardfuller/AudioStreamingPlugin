@@ -84,7 +84,7 @@ __asm__(".symver pthread_join,pthread_join@GLIBC_2.17");
 #define LOG_LINES         32
 #define LOG_LEN           128
 #define LOG_MSG           96
-#define MODULE_VERSION    "0.4.0"
+#define MODULE_VERSION    "0.4.1"
 
 enum { C_FREE = 0, C_REQUEST, C_STREAM, C_RESPOND };   /* RESPOND: one-shot /status or /log reply */
 
@@ -221,11 +221,13 @@ typedef struct {
 
 #define LIM_T 27853.0f                               /* soft-limit knee, 0.85 FS */
 
-/* Meter the source samples; if `emit`, apply stream gain + soft limiter in place.
+/* Meter the source samples and apply stream gain + soft limiter in place. This runs
+ * even with no listener (the result is simply not sent), so the meter reports exactly
+ * what a listener would get.
  * Below the knee (and at 0 dB) samples pass bit-exact; above it they are
  * compressed smoothly toward (never reaching) full scale, so the stream cannot
  * hard-clip because of us. */
-static void process_chunk(meter_t *m, int16_t *c, int nf, int emit, float gain, int lim)
+static void process_chunk(meter_t *m, int16_t *c, int nf, float gain, int lim)
 {
     int n = nf * 2;
     for (int i = 0; i < n; i++) {
@@ -235,7 +237,6 @@ static void process_chunk(meter_t *m, int16_t *c, int nf, int emit, float gain, 
         m->sumsq += (uint64_t)((int64_t)v * v);
     }
     m->n += (uint64_t)n;
-    if (!emit) { m->peak_out = m->peak_in; return; }
     if (gain == 1.0f && !lim) {
         m->peak_out = m->peak_in;
         return;
@@ -723,7 +724,7 @@ static void *worker(void *arg)
                     chunk[i * 2 + 1] = s->ring[idx + 1];
                 }
                 s->rd += (uint64_t)nf;
-                process_chunk(&mt, chunk, nf, streaming, gain, lim);
+                process_chunk(&mt, chunk, nf, gain, lim);
                 if (streaming) emit_chunk(s, chunk, nf, limit);
             }
         } else {                                           /* src == 2: Schwung capture ring */
@@ -746,7 +747,7 @@ static void *worker(void *arg)
                     memmove(chunk, chunk + lapped * 2, (size_t)(nf - (int)lapped) * 4);
                     nf -= (int)lapped;
                 }
-                process_chunk(&mt, chunk, nf, streaming, gain, lim);
+                process_chunk(&mt, chunk, nf, gain, lim);
                 if (streaming) emit_chunk(s, chunk, nf, limit);
             }
         }

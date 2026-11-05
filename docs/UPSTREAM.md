@@ -17,3 +17,9 @@ knob (module reading `/dev/shm/schwung-audio-live`, Schwung with Link Audio rout
 configuration (`rebuild_from_la` vs. the 1/mv path), and can `shadow_master_volume` be stale there? Also: `host->log` from a
 chain FX appears only when `debug_log_on` exists, and `unified_log_enabled()` re-reads the flag by call count — lines logged
 shortly after load are lost.
+
+Details for #3 (from reading `schwung_shim.c`, current main): the non-rebuild `unity_view` hard-clamps after
+`* inv_mv` (up to 50x), whereas the rebuild sum already goes through `mix_soft_clip`. Suggestion: build the capture view
+with the same `mix_soft_clip` (or with headroom, e.g. -6 dB) instead of a hard clamp, and make sure `shadow_master_volume`
+is current when the ring is written. Measured on a Move reading the ring: ~150-240 full-scale samples/s (21k total) and a
+level that follows the volume knob.

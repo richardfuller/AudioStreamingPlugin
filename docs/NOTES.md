@@ -58,3 +58,14 @@ so it adds a static Gain and exposes `level_1s.peak_in` in `/status` to measure 
   rather than the module; `/status` on the stream port is a quick way to tell whether the module is alive.
 - Parameter page now lists: Stream, Source, Gain, Limit, Latency, Port, Status, Clients, Drops. Record what the
   device actually shows (and whether "No presets" appears) after the next install.
+
+## Where the tap can clip (read from schwung_shim.c / mix_soft_clip.h)
+- **Rebuild path** (Link Audio routing on, >= 4 channels): tracks, slots, overtake DSP and send returns are summed in
+  int32 and converted once through `mix_soft_clip` (identity to -1 dBFS, tanh shoulder, never quite full scale).
+  Schwung added that after measuring 3272 clipped samples in 30 s there. The tap `unity_view` is a copy of that mailbox
+  taken before master volume. (The line-in "jack" mix just before it still hard-clamps per add.)
+- **Non-rebuild path:** `unity_view[i] = clamp(native_move[i] * inv_mv + me_unity[i])` with `inv_mv = 1/smoothed_mv`
+  capped at 50, then a **hard clamp** to int16. Any real Move level times a small `mv` overshoots and flat-tops, and the
+  level follows `mv`.
+- **Fast path** (nothing of Schwung's running): the mailbox un-scaled by the same 1/mv and clamped by `audio_live_push`.
+Which path is live decides the cause; the sweep in the README distinguishes them. Reported upstream in `docs/UPSTREAM.md` #3.
