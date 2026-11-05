@@ -1,0 +1,17 @@
+{
+    "id": "audio-stream",
+    "name": "Audio Stream",
+    "version": "0.1.0",
+    "abbrev": "STRM",
+    "description": "Streams audio over WiFi as an HTTP WAV stream",
+    "author": "richardfuller",
+    "dsp": "audio-stream.so",
+    "api_version": 2,
+    "capabilities": {
+        "component_type": "audio_fx",
+        "audio_in": true,
+        "audio_out": true,
+        "chainable": true,
+        "requires_continuous_processing": true
+    }
+}
