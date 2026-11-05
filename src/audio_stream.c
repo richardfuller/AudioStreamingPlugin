@@ -81,13 +81,18 @@ __asm__(".symver pthread_join,pthread_join@GLIBC_2.17");
 #define SNDBUF_LOW        (8 * 1024)
 #define CHUNK_FRAMES      1024
 #define REQ_MAX           1024
+#define LOG_LINES         32
+#define LOG_LEN           128
+#define LOG_MSG           96
+#define MODULE_VERSION    "0.4.0"
 
-enum { C_FREE = 0, C_REQUEST, C_STREAM };
+enum { C_FREE = 0, C_REQUEST, C_STREAM, C_RESPOND };   /* RESPOND: one-shot /status or /log reply */
 
 typedef struct {
     int fd;
     int state;
     int sndbuf_low;
+    int close_after;
     uint64_t t_accept, t_progress;
     uint8_t req[REQ_MAX];
     size_t reqlen;
@@ -95,6 +100,11 @@ typedef struct {
     uint64_t hdr_total, s_total;         /* header bytes queued / bytes sent */
     uint8_t buf[CLIENT_BUF];
 } client_t;
+
+typedef struct {
+    const audio_live_shm_t *m;
+    uint64_t rd, last_wp, last_change, next_probe;
+} tap_t;
 
 typedef struct {
     int16_t ring[RING_FRAMES * 2];
@@ -108,6 +118,16 @@ typedef struct {
     _Atomic int source;                  /* 0 Auto, 1 FX input, 2 Move mix */
     _Atomic int src_in_use;              /* 0 none, 1 FX input, 2 Move mix */
     _Atomic int tap_ok;                  /* capture ring present and advancing */
+    _Atomic int gain_db;                 /* stream gain, -24..+12 dB (stream only; device audio untouched) */
+    _Atomic int limiter;                 /* soft limiter on the stream */
+    _Atomic int tap_state;               /* 0 ring absent, 1 present but idle, 2 live */
+    /* 1-second level meter, published by the worker (linear 0..1 scaled by 1e4) */
+    _Atomic int m_peak_in, m_peak_out, m_rms_in;
+    _Atomic uint32_t m_clip_in, m_limited;       /* samples in the last second */
+    _Atomic uint64_t clip_in_total, frames_in, tap_wp;
+    uint64_t start_ms;
+    uint32_t log_seq;                    /* log ring: written by loader/worker threads only */
+    char logbuf[LOG_LINES][LOG_LEN];
     _Atomic int clients;                 /* streaming clients */
     _Atomic uint32_t drops;              /* overflow/resync events */
     int port_span, stall_ms, sample_rate;
@@ -120,18 +140,33 @@ typedef struct {
 static const host_api_v1_t *g_host;
 static audio_fx_api_v2_t g_api;
 
-/* Non-realtime diagnostics -> Schwung Manager "System > Logs". Only ever called
- * from the worker thread or create/destroy (loader thread), never from the
- * audio callback or get/set_param. */
-static void dlog(const char *fmt, ...)
+/* Non-realtime diagnostics. Lines are kept in an in-memory ring (served at
+ * GET /log and in GET /status) AND sent to host->log. The host logger only
+ * writes while /data/UserData/schwung/debug_log_on exists and it re-checks that
+ * flag by call count, so early lines are often lost there; the ring is the
+ * reliable copy. Only ever called from the worker thread or create/destroy
+ * (loader thread), never from the audio callback or get/set_param. */
+static uint64_t now_ms(void);
+static void dlog(inst_t *s, const char *fmt, ...)
 {
-    if (!g_host || !g_host->log) return;
-    char m[200];
-    int n = snprintf(m, sizeof m, "[audio-stream] ");
+    char m[LOG_MSG];
     va_list ap; va_start(ap, fmt);
-    vsnprintf(m + n, sizeof m - (size_t)n, fmt, ap);
+    vsnprintf(m, sizeof m, fmt, ap);
     va_end(ap);
-    g_host->log(m);
+    for (char *p = m; *p; p++)                       /* keep it JSON/text safe */
+        if (*p == '"' || *p == '\\') *p = '\'';
+        else if ((unsigned char)*p < 0x20) *p = ' ';
+    if (s) {
+        uint64_t up = now_ms() - s->start_ms;
+        snprintf(s->logbuf[s->log_seq % LOG_LINES], LOG_LEN, "%llu.%01llus %s",
+                 (unsigned long long)(up / 1000), (unsigned long long)((up % 1000) / 100), m);
+        s->log_seq++;
+    }
+    if (g_host && g_host->log) {
+        char h[LOG_MSG + 20];
+        snprintf(h, sizeof h, "[audio-stream] %s", m);
+        g_host->log(h);
+    }
 }
 
 /* ------------------------------ helpers --------------------------------- */
@@ -167,6 +202,72 @@ static void build_wav_header(uint8_t *h, int rate)
     v = 4;              memcpy(h + 32, &v, 2);        /* block align */
     v = 16;             memcpy(h + 34, &v, 2);        /* bits */
     memcpy(h + 36, "data", 4); memcpy(h + 40, &big, 4);
+}
+
+/* Gain table: 10^(dB/20) for -24..+12 without libm. */
+static float db_to_lin(int db)
+{
+    const float step = 1.1220184543f;                /* 10^(1/20) */
+    float g = 1.0f;
+    for (int i = 0; i < (db < 0 ? -db : db); i++) g = db < 0 ? g / step : g * step;
+    return g;
+}
+
+typedef struct {
+    uint64_t win_start, sumsq, n;
+    int peak_in, peak_out;
+    uint32_t clip_in, limited;
+} meter_t;
+
+#define LIM_T 27853.0f                               /* soft-limit knee, 0.85 FS */
+
+/* Meter the source samples; if `emit`, apply stream gain + soft limiter in place.
+ * Below the knee (and at 0 dB) samples pass bit-exact; above it they are
+ * compressed smoothly toward (never reaching) full scale, so the stream cannot
+ * hard-clip because of us. */
+static void process_chunk(meter_t *m, int16_t *c, int nf, int emit, float gain, int lim)
+{
+    int n = nf * 2;
+    for (int i = 0; i < n; i++) {
+        int v = c[i], a = v < 0 ? -v : v;
+        if (a > m->peak_in) m->peak_in = a;
+        if (a >= 32767) m->clip_in++;
+        m->sumsq += (uint64_t)((int64_t)v * v);
+    }
+    m->n += (uint64_t)n;
+    if (!emit) { m->peak_out = m->peak_in; return; }
+    if (gain == 1.0f && !lim) {
+        m->peak_out = m->peak_in;
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        float x = (float)c[i] * gain, ax = x < 0 ? -x : x;
+        if (lim && ax > LIM_T) {
+            float z = (ax - LIM_T) / (32768.0f - LIM_T);
+            ax = LIM_T + (32768.0f - LIM_T) * (z / (1.0f + z));
+            m->limited++;
+        }
+        if (ax > 32767.0f) ax = 32767.0f;
+        int o = (int)(ax + 0.5f);
+        if (o > m->peak_out) m->peak_out = o;
+        c[i] = (int16_t)(x < 0 ? -o : o);
+    }
+}
+
+static void meter_publish(inst_t *s, meter_t *m, uint64_t now, int force)
+{
+    if (!force && now - m->win_start < 1000) return;
+    atomic_store(&s->m_peak_in, m->peak_in * 10000 / 32768);
+    atomic_store(&s->m_peak_out, m->peak_out * 10000 / 32768);
+    uint64_t ms = m->n ? m->sumsq / m->n : 0, r = 0;      /* integer sqrt of mean square */
+    while (r * r <= ms) r++;
+    atomic_store(&s->m_rms_in, m->n ? (int)((r ? r - 1 : 0) * 10000 / 32768) : 0);
+    atomic_store(&s->m_clip_in, m->clip_in);
+    atomic_store(&s->m_limited, m->limited);
+    atomic_fetch_add(&s->clip_in_total, m->clip_in);
+    atomic_fetch_add(&s->frames_in, m->n / 2);
+    memset(m, 0, sizeof *m);
+    m->win_start = now;
 }
 
 static void send_status_line(int fd, const char *status)
@@ -256,14 +357,75 @@ static void accept_clients(inst_t *s, int lfd, uint64_t now)
         client_t *c = &s->cl[slot];
         c->fd = fd; c->state = C_REQUEST;
         c->t_accept = c->t_progress = now;
-        c->reqlen = 0; c->off = c->len = 0; c->hdr_total = c->s_total = 0;
+        c->reqlen = 0; c->off = c->len = 0; c->hdr_total = c->s_total = 0; c->close_after = 0;
         apply_sndbuf(c, atomic_load(&s->low_latency));
     }
 }
 
+static const char *src_name(int v) { return v == 2 ? "mix" : v == 1 ? "fx" : "none"; }
+
+static size_t build_status_json(inst_t *s, const tap_t *tap, char *o, size_t cap)
+{
+    int mode = atomic_load(&s->source), src = atomic_load(&s->src_in_use), ts = atomic_load(&s->tap_state);
+    uint64_t up = now_ms() - s->start_ms;
+    size_t n = (size_t)snprintf(o, cap,
+        "{\"module\":\"audio-stream\",\"version\":\"" MODULE_VERSION "\","
+        "\"uptime_s\":%llu,\"enabled\":%d,\"port_requested\":%d,\"port_bound\":%d,\"bind_errno\":%d,"
+        "\"clients\":%d,\"drops\":%u,"
+        "\"source_mode\":\"%s\",\"source_in_use\":\"%s\","
+        "\"tap\":{\"present\":%s,\"live\":%s,\"write_pos\":%llu,\"path\":\"%s\"},"
+        "\"gain_db\":%d,\"limiter\":%d,\"latency\":\"%s\","
+        "\"level_1s\":{\"peak_in\":%d.%04d,\"peak_out\":%d.%04d,\"rms_in\":%d.%04d,"
+        "\"clipped_in_samples\":%u,\"limited_samples\":%u},"
+        "\"clipped_in_total\":%llu,\"frames_seen\":%llu,"
+        "\"hint\":\"%s\",\"log\":[",
+        (unsigned long long)(up / 1000), atomic_load(&s->enabled), atomic_load(&s->req_port),
+        atomic_load(&s->bound_port), atomic_load(&s->bind_err), atomic_load(&s->clients),
+        (unsigned)atomic_load(&s->drops),
+        mode == 2 ? "mix" : mode == 1 ? "fx" : "auto", src_name(src),
+        tap->m ? "true" : "false", ts == 2 ? "true" : "false",
+        (unsigned long long)tap->last_wp, AUDIO_LIVE_SHM_PATH,
+        atomic_load(&s->gain_db), atomic_load(&s->limiter), atomic_load(&s->low_latency) ? "low" : "normal",
+        atomic_load(&s->m_peak_in) / 10000, atomic_load(&s->m_peak_in) % 10000,
+        atomic_load(&s->m_peak_out) / 10000, atomic_load(&s->m_peak_out) % 10000,
+        atomic_load(&s->m_rms_in) / 10000, atomic_load(&s->m_rms_in) % 10000,
+        (unsigned)atomic_load(&s->m_clip_in), (unsigned)atomic_load(&s->m_limited),
+        (unsigned long long)atomic_load(&s->clip_in_total), (unsigned long long)atomic_load(&s->frames_in),
+        !tap->m ? "capture ring absent: enable Schwung Manager > Config > Mirror Display (display_mirror_enabled) and restart Move"
+                : ts != 2 ? "capture ring present but not advancing" : "ok");
+    uint32_t first = s->log_seq > LOG_LINES ? s->log_seq - LOG_LINES : 0;
+    for (uint32_t i = first; i < s->log_seq && n < cap - 160; i++)
+        n += (size_t)snprintf(o + n, cap - n, "%s\"%s\"", i == first ? "" : ",", s->logbuf[i % LOG_LINES]);
+    n += (size_t)snprintf(o + n, cap - n, "]}\n");
+    return n;
+}
+
+static size_t build_log_text(inst_t *s, char *o, size_t cap)
+{
+    size_t n = 0;
+    uint32_t first = s->log_seq > LOG_LINES ? s->log_seq - LOG_LINES : 0;
+    for (uint32_t i = first; i < s->log_seq && n < cap - LOG_LEN - 4; i++)
+        n += (size_t)snprintf(o + n, cap - n, "%s\n", s->logbuf[i % LOG_LINES]);
+    return n;
+}
+
+/* Queue a complete one-shot reply (headers + body); connection closes once sent. */
+static void client_respond(client_t *c, uint64_t now, const char *ctype, const char *body, size_t blen)
+{
+    char h[200];
+    int hn = snprintf(h, sizeof h,
+        "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+        "Cache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", ctype, blen);
+    c->state = C_RESPOND; c->close_after = 1; c->t_progress = now;
+    if ((size_t)hn + blen > CLIENT_BUF) blen = CLIENT_BUF - (size_t)hn;
+    memcpy(c->buf, h, (size_t)hn);
+    memcpy(c->buf + hn, body, blen);
+    c->off = 0; c->len = (size_t)hn + blen;
+}
+
 /* Returns after consuming whatever request bytes are available. */
 static void client_read_request(inst_t *s, client_t *c, uint64_t now,
-                                const uint8_t *wavhdr, size_t limit)
+                                const uint8_t *wavhdr, size_t limit, const tap_t *tap)
 {
     ssize_t n = recv(c->fd, c->req + c->reqlen, REQ_MAX - 1 - c->reqlen, 0);
     if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
@@ -301,6 +463,13 @@ static void client_read_request(inst_t *s, client_t *c, uint64_t now,
         client_close(s, c);
         return;
     }
+    if (!strcmp(path, "/status") || !strcmp(path, "/log")) {   /* diagnostics: no stream slot used */
+        char body[9000];                                    /* per call: instances run separate workers */
+        size_t bl = !strcmp(path, "/log") ? build_log_text(s, body, sizeof body)
+                                          : build_status_json(s, tap, body, sizeof body);
+        client_respond(c, now, !strcmp(path, "/log") ? "text/plain" : "application/json", body, bl);
+        return;
+    }
     if (strcmp(path, "/") && strncmp(path, "/?", 2)) {
         send_status_line(c->fd, "404 Not Found");
         client_close(s, c);
@@ -321,7 +490,7 @@ static void client_read_request(inst_t *s, client_t *c, uint64_t now,
     c->state = C_STREAM;
     c->t_progress = now;
     atomic_fetch_add(&s->clients, 1);
-    dlog("client connected (%d streaming)", atomic_load(&s->clients));
+    dlog(s, "client connected (%d streaming)", atomic_load(&s->clients));
     client_queue(s, c, http, sizeof http - 1, limit);
     client_queue(s, c, wavhdr, 44, limit);
     c->hdr_total = c->len;
@@ -369,12 +538,7 @@ static int try_bind(inst_t *s, int port, int *err_out)
 }
 
 /* ---- Move-mix tap (Schwung capture ring), read-only, worker thread only ---- */
-typedef struct {
-    const audio_live_shm_t *m;
-    uint64_t rd, last_wp, last_change, next_probe;
-} tap_t;
-
-static void tap_probe(tap_t *t, uint64_t now)
+static void tap_probe(inst_t *s, tap_t *t, uint64_t now)
 {
     if (t->m || now < t->next_probe) return;
     t->next_probe = now + TAP_PROBE_MS;
@@ -396,7 +560,7 @@ static void tap_probe(tap_t *t, uint64_t now)
     t->last_wp = __atomic_load_n(&m->write_pos, __ATOMIC_ACQUIRE);
     t->rd = t->last_wp;
     t->last_change = now;
-    dlog("capture ring found (%s)", AUDIO_LIVE_SHM_PATH);
+    dlog(s, "capture ring found (%s)", AUDIO_LIVE_SHM_PATH);
 }
 
 /* Track whether the shim is actually producing audio into the ring. */
@@ -439,8 +603,10 @@ static void *worker(void *arg)
     struct pollfd pfd[MAX_SLOTS + 1];
     int pidx[MAX_SLOTS + 1];
     int logged_bound = 0, logged_err = 0, logged_src = -1, logged_clients = 0;
+    meter_t mt; memset(&mt, 0, sizeof mt); mt.win_start = now_ms();
+    uint64_t next_beat = now_ms() + 60000;
 
-    dlog("worker started");
+    dlog(s, "worker started");
     while (!atomic_load(&s->quit)) {
         uint64_t now = now_ms();
         int low = atomic_load(&s->low_latency);
@@ -450,7 +616,7 @@ static void *worker(void *arg)
         if (!atomic_load(&s->enabled)) {
             /* Disabled: close the listener and every client, discard audio. */
             close_all(s);
-            if (lfd >= 0) { close(lfd); lfd = -1; atomic_store(&s->bound_port, 0); dlog("disabled, listener closed"); logged_bound = 0; }
+            if (lfd >= 0) { close(lfd); lfd = -1; atomic_store(&s->bound_port, 0); dlog(s, "disabled, listener closed"); logged_bound = 0; }
             atomic_store(&s->bind_err, 0);
             atomic_store(&s->src_in_use, 0);
             s->rd = atomic_load(&s->wr);
@@ -459,7 +625,7 @@ static void *worker(void *arg)
         }
 
         if (lfd >= 0 && want != bound_for_req) {         /* port changed: rebind */
-            dlog("port change %d -> %d, rebinding", bound_for_req, want);
+            dlog(s, "port change %d -> %d, rebinding", bound_for_req, want);
             close_all(s);
             close(lfd); lfd = -1;
             atomic_store(&s->bound_port, 0);
@@ -473,15 +639,17 @@ static void *worker(void *arg)
         }
         {   /* log bind state changes only (never per retry) */
             int bp = atomic_load(&s->bound_port), er = atomic_load(&s->bind_err);
-            if (bp != logged_bound && bp) dlog("listening on port %d (dual-stack)", bp);
-            if (er != logged_err && er) dlog("bind failed on port %d: errno %d%s", want, er, er == EADDRINUSE ? " (in use)" : "");
+            if (bp != logged_bound && bp) dlog(s, "listening on port %d (dual-stack)", bp);
+            if (er != logged_err && er) dlog(s, "bind failed on port %d: errno %d%s", want, er, er == EADDRINUSE ? " (in use)" : "");
             logged_bound = bp; logged_err = er;
         }
 
         /* Source selection + tap health. */
-        tap_probe(&tap, now);
+        tap_probe(s, &tap, now);
         int fresh = tap_fresh(&tap, now);
         atomic_store(&s->tap_ok, fresh);
+        atomic_store(&s->tap_state, !tap.m ? 0 : fresh ? 2 : 1);
+        atomic_store(&s->tap_wp, tap.last_wp);
         int mode = atomic_load(&s->source);
         int src = (mode == 1) ? 1 : (mode == 2) ? (fresh ? 2 : 0) : (fresh ? 2 : 1);
         if (src != atomic_load(&s->src_in_use)) {
@@ -490,7 +658,7 @@ static void *worker(void *arg)
             if (tap.m) tap.rd = __atomic_load_n(&tap.m->write_pos, __ATOMIC_ACQUIRE);
         }
         if (src != logged_src) {
-            dlog("source: %s", src == 2 ? "Move mix (capture ring)" : src == 1 ? "FX input" :
+            dlog(s, "source: %s", src == 2 ? "Move mix (capture ring)" : src == 1 ? "FX input" :
                  "none - capture ring not live (enable display_mirror_enabled in features.json)");
             logged_src = src;
         }
@@ -520,27 +688,31 @@ static void *worker(void *arg)
             client_t *c = &s->cl[pidx[k]];
             if (c->fd != pfd[k].fd) continue;
             if (c->state == C_REQUEST) {
-                client_read_request(s, c, now, wavhdr, limit);
+                client_read_request(s, c, now, wavhdr, limit, &tap);
+            } else if (c->state == C_RESPOND) {
+                uint8_t junk[256];                     /* half-closing clients still get their reply */
+                (void)!recv(c->fd, junk, sizeof junk, MSG_DONTWAIT);
             } else {                                   /* streaming: discard input, detect EOF */
                 uint8_t junk[256];
                 ssize_t r = recv(c->fd, junk, sizeof junk, 0);
                 if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
                     client_close(s, c);
-                    dlog("client disconnected (%d streaming)", atomic_load(&s->clients));
+                    dlog(s, "client disconnected (%d streaming)", atomic_load(&s->clients));
                 }
             }
         }
 
         streaming = atomic_load(&s->clients) > 0;
+        const float gain = db_to_lin(atomic_load(&s->gain_db));
+        const int lim = atomic_load(&s->limiter);
         uint64_t wr = atomic_load_explicit(&s->wr, memory_order_acquire);
-        if (!streaming || src == 0) {
-            /* Nobody to send to (or no source): stay at the live edge, copy nothing. */
-            s->rd = wr;
+        if (src == 0) {
+            s->rd = wr;                                    /* no source: nothing to meter or send */
             if (tap.m) tap.rd = tap.last_wp;
         } else if (src == 1) {
             if (wr - s->rd > RING_FRAMES) {                /* producer lapped us: resync */
                 s->rd = wr - RING_FRAMES / 2;
-                atomic_fetch_add(&s->drops, 1);
+                if (streaming) atomic_fetch_add(&s->drops, 1);
             }
             while (s->rd < wr) {
                 uint64_t avail = wr - s->rd;
@@ -551,7 +723,8 @@ static void *worker(void *arg)
                     chunk[i * 2 + 1] = s->ring[idx + 1];
                 }
                 s->rd += (uint64_t)nf;
-                emit_chunk(s, chunk, nf, limit);
+                process_chunk(&mt, chunk, nf, streaming, gain, lim);
+                if (streaming) emit_chunk(s, chunk, nf, limit);
             }
         } else {                                           /* src == 2: Schwung capture ring */
             const audio_live_shm_t *m = tap.m;
@@ -559,7 +732,7 @@ static void *worker(void *arg)
             if (wp < tap.rd) tap.rd = wp;                  /* shim restarted */
             if (wp - tap.rd > AUDIO_LIVE_FRAMES / 2) {     /* reader fell too far behind */
                 tap.rd = wp - AUDIO_LIVE_FRAMES / 4;
-                atomic_fetch_add(&s->drops, 1);
+                if (streaming) atomic_fetch_add(&s->drops, 1);
             }
             while (tap.rd < wp) {
                 uint64_t avail = wp - tap.rd;
@@ -568,13 +741,21 @@ static void *worker(void *arg)
                 uint64_t lapped = audio_live_lapped(m, tap.rd);
                 tap.rd += (uint64_t)nf;
                 if (lapped) {                              /* writer overwrote the oldest frames */
-                    atomic_fetch_add(&s->drops, 1);
+                    if (streaming) atomic_fetch_add(&s->drops, 1);
                     if (lapped >= (uint64_t)nf) continue;
                     memmove(chunk, chunk + lapped * 2, (size_t)(nf - (int)lapped) * 4);
                     nf -= (int)lapped;
                 }
-                emit_chunk(s, chunk, nf, limit);
+                process_chunk(&mt, chunk, nf, streaming, gain, lim);
+                if (streaming) emit_chunk(s, chunk, nf, limit);
             }
+        }
+        meter_publish(s, &mt, now, 0);
+        if (now >= next_beat) {
+            next_beat = now + 60000;
+            dlog(s, "alive: src=%s clients=%d peak_in=%d.%04d clip_total=%llu", src_name(src),
+                 atomic_load(&s->clients), atomic_load(&s->m_peak_in) / 10000, atomic_load(&s->m_peak_in) % 10000,
+                 (unsigned long long)atomic_load(&s->clip_in_total));
         }
 
         for (int i = 0; i < MAX_SLOTS; i++) {
@@ -588,11 +769,12 @@ static void *worker(void *arg)
                 continue;
             }
             client_flush(s, c, now);
-            if (c->fd < 0) { dlog("client dropped (send error)"); continue; }
+            if (c->fd < 0) { if (!c->close_after) dlog(s, "client dropped (send error)"); continue; }
+            if (c->state == C_RESPOND && !pending(c)) { shutdown(c->fd, SHUT_WR); client_close(s, c); continue; }
             if (!pending(c)) c->t_progress = now;
             else if (now - c->t_progress > (uint64_t)s->stall_ms) {
                 client_close(s, c);                        /* stalled */
-                dlog("client evicted (stalled > %d ms)", s->stall_ms);
+                dlog(s, "client evicted (stalled > %d ms)", s->stall_ms);
             }
         }
         int cn = atomic_load(&s->clients);
@@ -601,7 +783,7 @@ static void *worker(void *arg)
     close_all(s);
     if (lfd >= 0) close(lfd);
     if (tap.m) munmap((void *)tap.m, sizeof(audio_live_shm_t));
-    dlog("worker stopped");
+    dlog(s, "worker stopped");
     return NULL;
 }
 
@@ -631,7 +813,9 @@ static void *create_instance(const char *module_dir, const char *config_json)
     s->sample_rate = (g_host && g_host->sample_rate > 0) ? g_host->sample_rate
                                                           : MOVE_SAMPLE_RATE;
     atomic_store(&s->enabled, 1);
-    dlog("instance created, port %d", atomic_load(&s->req_port));
+    atomic_store(&s->limiter, 1);
+    s->start_ms = now_ms();
+    dlog(s, "instance created, port %d", atomic_load(&s->req_port));
     for (int i = 0; i < MAX_SLOTS; i++) s->cl[i].fd = -1;
     if (pthread_create(&s->thr, NULL, worker, s) == 0) s->thr_started = 1;
     return s;
@@ -672,6 +856,11 @@ static void set_param(void *inst, const char *key, const char *val)
     if (!strcmp(key, "enabled"))      atomic_store(&s->enabled, parse_enum01(val, "On"));
     else if (!strcmp(key, "latency")) atomic_store(&s->low_latency, parse_enum01(val, "Low"));
     else if (!strcmp(key, "port"))    atomic_store(&s->req_port, clamp_port(my_atoi(val)));
+    else if (!strcmp(key, "gain")) {
+        int g = my_atoi(val);
+        atomic_store(&s->gain_db, g < -24 ? -24 : g > 12 ? 12 : g);
+    }
+    else if (!strcmp(key, "limiter")) atomic_store(&s->limiter, parse_enum01(val, "On"));
     else if (!strcmp(key, "source")) {
         int v = (!strcmp(val, "Mix") || !strcmp(val, "2")) ? 2
               : (!strcmp(val, "FX in") || !strcmp(val, "1")) ? 1 : 0;
@@ -683,13 +872,15 @@ static void set_param(void *inst, const char *key, const char *val)
 #define PARAMS_JSON \
     "{\"key\":\"enabled\",\"name\":\"Stream\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"],\"default\":1}," \
     "{\"key\":\"source\",\"name\":\"Source\",\"type\":\"enum\",\"options\":[\"Auto\",\"FX in\",\"Mix\"],\"default\":0}," \
+    "{\"key\":\"gain\",\"name\":\"Gain\",\"type\":\"int\",\"min\":-24,\"max\":12,\"default\":0}," \
+    "{\"key\":\"limiter\",\"name\":\"Limit\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"],\"default\":1}," \
     "{\"key\":\"latency\",\"name\":\"Latency\",\"type\":\"enum\",\"options\":[\"Normal\",\"Low\"],\"default\":0}," \
     "{\"key\":\"port\",\"name\":\"Port\",\"type\":\"int\",\"min\":1024,\"max\":65535,\"default\":8800}," \
     "{\"key\":\"status\",\"name\":\"Status\",\"type\":\"string\",\"access\":\"read\"}," \
     "{\"key\":\"clients\",\"name\":\"Clients\",\"type\":\"int\",\"min\":0,\"max\":4,\"access\":\"read\"}," \
     "{\"key\":\"drops\",\"name\":\"Drops\",\"type\":\"int\",\"min\":0,\"max\":999999,\"access\":\"read\"}"
 
-#define KNOBS_JSON "[\"enabled\",\"source\",\"latency\",\"port\",\"status\",\"clients\",\"drops\"]"
+#define KNOBS_JSON "[\"enabled\",\"source\",\"gain\",\"limiter\",\"latency\",\"port\",\"status\",\"clients\",\"drops\"]"
 
 static const char CHAIN_PARAMS[] = "[" PARAMS_JSON "]";
 static const char UI_HIERARCHY[] =
@@ -710,7 +901,8 @@ static int status_str(inst_t *s, char *buf, int buf_len)
     if (!atomic_load(&s->enabled)) return put(buf, buf_len, "OFF");
     if (bp) {
         int c = atomic_load(&s->clients), src = atomic_load(&s->src_in_use);
-        const char *tag = src == 2 ? "MIX" : src == 1 ? "FX" : "NO MIX TAP";
+        int mode = atomic_load(&s->source);
+        const char *tag = src == 2 ? "MIX" : src == 1 ? (mode == 0 ? "FX (no tap)" : "FX") : "NO MIX TAP";
         return snprintf(buf, (size_t)buf_len, ":%d %d cl %s", bp, c, tag);
     }
     if (err == EADDRINUSE) return snprintf(buf, (size_t)buf_len, "PORT %d IN USE", atomic_load(&s->req_port));
@@ -727,6 +919,8 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len)
     if (!strcmp(key, "ui_hierarchy"))      return put(buf, buf_len, UI_HIERARCHY);
     if (!strcmp(key, "status"))            n = status_str(s, buf, buf_len);
     else if (!strcmp(key, "enabled"))      n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->enabled));
+    else if (!strcmp(key, "gain"))         n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->gain_db));
+    else if (!strcmp(key, "limiter"))      n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->limiter));
     else if (!strcmp(key, "source"))       n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->source));
     else if (!strcmp(key, "source_in_use")) n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->src_in_use));
     else if (!strcmp(key, "latency"))      n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->low_latency));

@@ -322,6 +322,102 @@ static void test_tap_source(void)
     unlink(AUDIO_LIVE_SHM_PATH);
 }
 
+
+/* Read an HTTP reply to EOF (for /status and /log). */
+static size_t http_get_all(int port, const char *path, char *out, size_t cap)
+{
+    int fd = dial(port, 0);
+    CHECK(fd >= 0, "connect for %s", path);
+    char req[128]; snprintf(req, sizeof req, "GET %s HTTP/1.0\r\n\r\n", path);
+    sendreq(fd, req);
+    size_t got = 0; ssize_t r;
+    do { r = slurp(fd, (uint8_t *)out, cap - 1, 500, &got); } while (r > 0);
+    out[got] = 0;
+    close(fd);
+    return got;
+}
+
+static void test_status_endpoints(void *inst, int port)
+{
+    static char b[16384];
+    for (int i = 0; i < 400; i++) pump(inst, 1);            /* feed a 1 s meter window */
+    http_get_all(port, "/status", b, sizeof b);
+    CHECK(!strncmp(b, "HTTP/1.0 200", 12), "status: %.40s", b);
+    CHECK(strstr(b, "application/json") && strstr(b, "\"module\":\"audio-stream\""), "status body");
+    CHECK(strstr(b, "\"source_in_use\":\"fx\"") && strstr(b, "\"tap\":{\"present\":false"), "status source/tap: %s", b);
+    CHECK(strstr(b, "Mirror Display"), "no hint about the display mirror");
+    CHECK(strstr(b, "\"log\":[\"") && strstr(b, "listening on port"), "log lines missing from status");
+    CHECK(strstr(b, "]}\n"), "status JSON not terminated");
+    CHECK(strstr(b, "\"peak_in\":0.2") != NULL || strstr(b, "\"peak_in\":0.24") != NULL, "peak meter: %s", strstr(b, "level_1s"));
+    http_get_all(port, "/log", b, sizeof b);
+    CHECK(strstr(b, "text/plain") && strstr(b, "worker started"), "/log body");
+    CHECK(get_int(inst, "clients") == 0, "status request used a stream slot");
+    PASS("GET /status (JSON: source, tap, level, log) and GET /log work without using a stream slot");
+}
+
+static int stream_peak(const uint8_t *rx, size_t got)
+{
+    const uint8_t *w = memmem(rx, got, "RIFF", 4);
+    if (!w || got < (size_t)(w - rx) + 44 + 8000) return -1;
+    const int16_t *pcm = (const int16_t *)(w + 44) + 2000;
+    size_t nfr = (got - (size_t)((const uint8_t *)pcm - rx)) / 4;
+    int pk = 0;
+    for (size_t i = 0; i < nfr * 2; i++) { int a = abs(pcm[i]); if (a > pk) pk = a; }
+    return pk;
+}
+
+/* Feed a +-amp square into the FX input and measure the peak on the stream. */
+static int measure_peak(void *inst, int amp)
+{
+    int fd = dial(18970, 0);
+    CHECK(fd >= 0, "connect gain port");
+    sendreq(fd, "GET / HTTP/1.0\r\n\r\n");
+    static uint8_t rx[200000]; size_t got = 0;
+    int16_t blk[256];
+    for (int b = 0; b < 300; b++) {
+        for (int i = 0; i < 128; i++) { int16_t v = (int16_t)(((b * 128 + i) / 50) % 2 ? amp : -amp); blk[i*2] = v; blk[i*2+1] = v; }
+        api->process_block(inst, blk, 128);
+        usleep(2900);
+        slurp(fd, rx, sizeof rx, 0, &got);
+    }
+    close(fd);
+    return stream_peak(rx, got);
+}
+
+static void test_gain_and_limiter(void)
+{
+    void *inst = api->create_instance(".", "{\"port\": 18970}");
+    usleep(200000);
+    api->set_param(inst, "source", "1");
+    int p;
+    p = measure_peak(inst, 6000);
+    CHECK(p == 6000, "0 dB + limiter below the knee must be bit-exact (got %d)", p);
+    api->set_param(inst, "gain", "6");
+    p = measure_peak(inst, 6000);
+    CHECK(p > 11900 && p < 12020, "+6 dB should be ~11970 (got %d)", p);
+    api->set_param(inst, "gain", "-12");
+    p = measure_peak(inst, 20000);
+    CHECK(p > 4950 && p < 5100, "-12 dB of 20000 should be ~5024 (got %d)", p);
+    api->set_param(inst, "gain", "0");
+    api->set_param(inst, "limiter", "0");
+    p = measure_peak(inst, 32767);
+    CHECK(p == 32767, "limiter off, 0 dB: full scale passes (got %d)", p);
+    api->set_param(inst, "limiter", "1");
+    p = measure_peak(inst, 32767);
+    CHECK(p < 32000 && p > 29000, "limiter should keep full-scale input below clipping (got %d)", p);
+    api->set_param(inst, "gain", "12");
+    p = measure_peak(inst, 20000);
+    CHECK(p < 32767 && p > 30000, "+12 dB into the limiter must not hard-clip (got %d)", p);
+    api->set_param(inst, "limiter", "0");
+    p = measure_peak(inst, 20000);
+    CHECK(p == 32767, "+12 dB with limiter off clips (got %d)", p);
+    static char b[16384];
+    http_get_all(18970, "/status", b, sizeof b);
+    CHECK(strstr(b, "\"gain_db\":12") && strstr(b, "\"limiter\":0") && strstr(b, "\"clipped_in_total\":"), "status gain fields");
+    PASS("stream gain is exact; soft limiter prevents clipping; clip counters exposed");
+    api->destroy_instance(inst);
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc > 1, "usage: host_test <plugin.so>");
@@ -347,6 +443,7 @@ int main(int argc, char **argv)
     test_stream_and_passthrough(inst, 18800);
     test_ipv6(18800);
     test_request_parsing(inst, 18800);
+    test_status_endpoints(inst, 18800);
     test_busy_503(inst, 18800);
     test_stall_eviction_and_drops(inst, 18800);
     test_silent_request_timeout(inst, 18800);
@@ -354,6 +451,7 @@ int main(int argc, char **argv)
     test_rebind(inst, 18800);
 
     test_tap_source();
+    test_gain_and_limiter();
 
     /* Port conflicts: a squatter on 18900. */
     int sq = socket(AF_INET, SOCK_STREAM, 0), one = 1;

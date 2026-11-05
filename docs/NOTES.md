@@ -44,3 +44,17 @@ check Manager's CPU view and the `[audio-stream]` log lines around the time.
 Parameters and a `ui_hierarchy` are served from `get_param("chain_params")` / `("ui_hierarchy")`,
 the documented dynamic route for audio FX. The host appends its own "My Presets" page; the module
 does not implement presets (**unverified** whether "No presets" still shows on the device).
+
+## Level follows the volume knob (device report)
+Shim code (`schwung_shim.c`): the ring is pushed from `unity_view` (full path) or from the Move mailbox un-scaled by
+`1/mv_live_smoothed` (fast path, no Schwung slot active); both clamp. `mv` is `shadow_master_volume`, read from
+`Settings.json` at start and then from `move_model_sync_master_volume()` or, as a fallback, a scan of Move's OLED
+volume bar. If that value is stale/stepped the tap tracks the knob. The module cannot read it (not in `host_api_v1_t`),
+so it adds a static Gain and exposes `level_1s.peak_in` in `/status` to measure it. Open: confirm which path is active
+(look for "Master volume:" lines in Schwung's debug log) and report upstream.
+
+## Other
+- A report of Schwung Manager being unreachable may be a DHCP change (e.g. .44 -> .45) or `move.local` resolution
+  rather than the module; `/status` on the stream port is a quick way to tell whether the module is alive.
+- Parameter page now lists: Stream, Source, Gain, Limit, Latency, Port, Status, Clients, Drops. Record what the
+  device actually shows (and whether "No presets" appears) after the next install.
