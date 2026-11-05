@@ -23,3 +23,7 @@ Details for #3 (from reading `schwung_shim.c`, current main): the non-rebuild `u
 with the same `mix_soft_clip` (or with headroom, e.g. -6 dB) instead of a hard clamp, and make sure `shadow_master_volume`
 is current when the ring is written. Measured on a Move reading the ring: ~150-240 full-scale samples/s (21k total) and a
 level that follows the volume knob.
+
+Additional observation for #3: with the capture ring streamed, turning the master volume knob leaves Schwung's own synth
+unchanged but changes the level of native Move instruments. I.e. the ME component is at unity but the Move component is
+not being un-scaled correctly (stale `shadow_master_volume` in the `inv_mv` path, or Link Audio tracks already post-volume).

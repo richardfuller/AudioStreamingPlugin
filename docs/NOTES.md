@@ -69,3 +69,15 @@ so it adds a static Gain and exposes `level_1s.peak_in` in `/status` to measure 
   level follows `mv`.
 - **Fast path** (nothing of Schwung's running): the mailbox un-scaled by the same 1/mv and clamped by `audio_live_push`.
 Which path is live decides the cause; the sweep in the README distinguishes them. Reported upstream in `docs/UPSTREAM.md` #3.
+
+## Device observation: only native Move audio follows the knob
+Streamed to VLC with Mix: turning the volume knob did **not** change Schwung's own synth but **did** change the native
+Move instruments. So the ME (Schwung) component reaches the tap at unity while the Move component is still attenuated.
+That points at the Move-side un-scaling: either `shadow_master_volume` is stale when `inv_mv` is computed (non-rebuild
+path), or Move's Link Audio track feeds are already post-volume (rebuild path). The module cannot fix this (a Gain
+applies to the whole mix and the module cannot read the knob). Discriminating tests:
+1. Schwung debug log (needs `debug_log_on`): "Master volume: ..." lines while turning the knob; if none appear, the value
+   is not being updated.
+2. Toggle Link Audio routing (Manager > Config) off/on and repeat: if natives stop following the knob in one setting,
+   that setting's path is the correct one and the other has the bug.
+3. `/status` `level_1s.peak_in` with only a native track playing vs. only a Schwung synth, at several knob positions.
