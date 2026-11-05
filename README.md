@@ -9,29 +9,42 @@ ffplay http://move.local:8800/
 vlc    http://move.local:8800/
 ```
 
-Status: verified on a Move (valid WAV, real-time, no dropouts, 4 simultaneous clients,
-install via Schwung Manager). Items marked **unverified** below still need a device test.
+Verified on a Move: valid WAV, real-time, no dropouts, 4 simultaneous clients, install via Schwung Manager,
+stall eviction, request parsing. Items marked **unverified** still need a device test (Mix source, IPv6,
+parameter page, `enabled`/port/latency changes, measured latency).
 
-## Streaming everything vs. one track
-An audio FX only hears the signal of the place it is loaded:
+## Capturing Move's own tracks
+**Tested on a Move:** putting an audio FX in the **Master FX** slot, even with *Move→Schwung* (Link Audio
+routing) on, did **not** capture native Move tracks — only Schwung's own synths were heard. An FX slot or
+Master FX sits on Schwung's bus; Move's native output is left untouched. So the module has two sources
+(param **Source**):
 
-| Where you load it | What it hears |
-|---|---|
-| A track slot's FX | only that Schwung slot |
-| **Master FX** slot | the full mix Schwung sees |
+| Source | Hears | Needs |
+|---|---|---|
+| **FX in** | whatever reaches the slot the module is loaded in (Schwung audio only, unless Schwung routes a Move track into that slot) | nothing |
+| **Mix** | Move's **full mix** at unity (native tracks + Schwung), independent of the volume knob, after the master filter | Schwung's capture ring must be on (below) |
+| **Auto** (default) | Mix when the ring is live, otherwise FX in | – |
 
-To stream **all four Move tracks**: load the module in a **Master FX** slot **and** enable
-Schwung's **Move → Schwung** audio routing (Move's per-track audio is fed in via Link Audio).
-Whether this captures all four native tracks is **unverified** — see `docs/NOTES.md`.
-The volume knob: **unverified** whether the stream level follows it.
+**Mix** reads Schwung's capture ring (`/dev/shm/schwung-audio-live`, the same audio Skipback and the sampler record)
+from the module's worker thread. Schwung only fills that ring while its **display mirror** is enabled
+(`"display_mirror_enabled": true` in `/data/UserData/schwung/config/features.json`, read at startup, default off;
+look for a matching option on Schwung Manager's Config page, otherwise edit the file and restart Schwung).
+`Status` shows `MIX`, `FX`, or `NO MIX TAP` (ring not live → enable the display mirror).
+
+Caveats:
+- **Unverified on a device:** the Mix source was built from Schwung's source and tested against a fake ring only.
+- With no Schwung slot loaded, Schwung un-scales Move's output by 1/master-volume (max 50×) for this ring, so very low
+  volume settings get noisier and volume 0 is silent. With a slot loaded the ring is exact.
+- Any instance can use Mix; you only need one. Per-slot instances in *FX in* mode each hear only their slot.
 
 ## Parameters (shown on the Move screen)
 | Param | Meaning |
 |---|---|
+| Source | Auto / FX in / Mix (see above) |
 | Stream | Off / On. Off closes the listener and disconnects clients |
 | Latency | Normal (~370 ms backlog) / Low (~93 ms backlog, more dropouts on bad WiFi) |
 | Port | Start port (default 8800); changing it rebinds live |
-| Status | `:8800 2 clients`, `OFF`, `PORT 8800 IN USE`, `BIND ERR n` |
+| Status | `:8800 2 cl MIX`, `OFF`, `PORT 8800 IN USE`, `BIND ERR n` |
 | Clients | Listeners currently streaming (max 4) |
 | Drops | Times a slow listener (or the ring) had to skip ahead |
 
@@ -39,9 +52,12 @@ Config JSON (module config): `port`, `port_span` (default 16), `stall_ms` (defau
 
 ## Server behaviour
 - Serves only `GET /` (404 other paths, 405 other methods, 400 junk, 408 if no request in 5 s).
-- 5th listener gets `503 Busy`. A listener that stops reading for `stall_ms` is dropped.
+- 5th listener gets a readable `503 Busy` (the request is read first, then the 503 is sent).
+- Listens on IPv6 and IPv4 (dual-stack), so `move.local` works even when it resolves to IPv6 (**unverified on a device**; if VLC says "unable to open MRL", use the Move's IP address). A listener that stops reading for `stall_ms` is dropped.
 - A listener that falls behind skips to the newest audio (frame-aligned) instead of clicking at random.
 - If the port is busy it tries the next ports (up to `port_span`), so two instances do not collide; `Status` shows the real port. If none is free it retries every second and says `PORT n IN USE`.
+- Quiet when idle: with no listener the worker sleeps in `poll()` (100 ms housekeeping), at `nice 10`, off core 3. Only streaming wakes it every 5 ms.
+- Diagnostics go to Schwung Manager → System → Logs (prefix `[audio-stream]`): bind result, source, client connect/drop, rebinds. None are written from the audio thread.
 - The audio thread only copies samples into a lock-free ring; networking runs on a demoted worker thread off core 3.
 
 ## Low-latency playback
@@ -70,7 +86,7 @@ fixing the read-only-directory extract error from Windows `tar`.
 ## Install / remove
 - Schwung Manager (http://move.local:7700) → Install Custom Module → upload the tarball; or copy
   `audio-stream/` to `/data/UserData/schwung/modules/audio_fx/` and restart Schwung.
-- **Remove:** in the slot/Master FX, highlight the module and press **Delete + jog click**
-  (the module page has no other exit).
+- **Remove:** **Shift + jog click → None** on the slot, or the module's **Module** page → **Remove Module**.
+  Do **not** use Delete + jog click: Move's native Delete handler also sees it and deletes the selected clip.
 
 `src/schwung/*.h` are vendored unmodified from [charlesvestal/schwung](https://github.com/charlesvestal/schwung) (MIT).

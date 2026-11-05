@@ -11,9 +11,16 @@
  * allocates, locks, logs or does I/O. It writes the ring and bumps an atomic.
  * set_param/get_param also only touch atomics and format short strings.
  *
+ * Sources (param `source`):
+ *   Auto / FX input / Move mix. "Move mix" reads Schwung's capture ring
+ *   (/dev/shm/schwung-audio-live, see schwung/audio_live_shm.h) from the worker
+ *   thread: Move's full mix at unity, independent of the volume knob, including
+ *   native tracks. Schwung only fills that ring while features.json has
+ *   "display_mirror_enabled": true. "FX input" is whatever reaches this FX slot.
+ *
  * Server behaviour:
  *   - Only "GET /" is served (404/405 otherwise, 400 on junk, 408 on silence).
- *   - Up to MAX_CLIENTS listeners; extra connections get "503 Busy".
+ *   - Up to MAX_STREAMS listeners; the next one gets a readable "503 Busy".
  *   - A client that stops reading for stall_ms is evicted.
  *   - A client that falls behind drops to the newest audio (frame-aligned)
  *     instead of losing arbitrary chunks.
@@ -34,15 +41,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "schwung/audio_fx_api_v2.h"
+#include "schwung/audio_live_shm.h"
 
 /* Keep the binary loadable on old device glibc (needs only GLIBC_2.17): bind
  * the thread calls to their 2.17 versions even when built on a newer system,
- * and avoid sscanf/strtol/atoi (redirected to GLIBC_2.38 symbols by new headers). */
+ * and avoid sscanf/strtol/atoi (redirected to GLIBC_2.38 symbols by new headers)
+ * and fstat (GLIBC_2.33). Verified by: make check-glibc */
 #if defined(__aarch64__) && defined(__GLIBC__)
 __asm__(".symver pthread_create,pthread_create@GLIBC_2.17");
 __asm__(".symver pthread_join,pthread_join@GLIBC_2.17");
@@ -55,7 +68,12 @@ __asm__(".symver pthread_join,pthread_join@GLIBC_2.17");
 #define BIND_RETRY_MS     1000
 #define RING_FRAMES       65536          /* power of two, ~1.5 s */
 #define RING_MASK         (RING_FRAMES - 1)
-#define MAX_CLIENTS       4
+#define MAX_STREAMS       4              /* simultaneous listeners */
+#define MAX_SLOTS         8              /* + connections still sending their request (so 503 is readable) */
+#define IDLE_POLL_MS      100            /* no listeners: just wait for accept() */
+#define DISABLED_POLL_MS  250
+#define TAP_FRESH_MS      500            /* tap counts as live if write_pos moved this recently */
+#define TAP_PROBE_MS      2000
 #define CLIENT_BUF        (64 * 1024)
 #define LIMIT_NORMAL      (64 * 1024)    /* pending bytes before drop-to-latest, ~370 ms */
 #define LIMIT_LOW         (16 * 1024)    /* ~93 ms */
@@ -87,17 +105,34 @@ typedef struct {
     _Atomic int req_port;                /* port asked for (param/config) */
     _Atomic int bound_port;              /* port actually listening, 0 = none */
     _Atomic int bind_err;                /* errno of last failed bind, 0 = none */
+    _Atomic int source;                  /* 0 Auto, 1 FX input, 2 Move mix */
+    _Atomic int src_in_use;              /* 0 none, 1 FX input, 2 Move mix */
+    _Atomic int tap_ok;                  /* capture ring present and advancing */
     _Atomic int clients;                 /* streaming clients */
     _Atomic uint32_t drops;              /* overflow/resync events */
     int port_span, stall_ms, sample_rate;
     pthread_t thr;
     int thr_started;
     _Atomic int quit;
-    client_t cl[MAX_CLIENTS];
+    client_t cl[MAX_SLOTS];
 } inst_t;
 
 static const host_api_v1_t *g_host;
 static audio_fx_api_v2_t g_api;
+
+/* Non-realtime diagnostics -> Schwung Manager "System > Logs". Only ever called
+ * from the worker thread or create/destroy (loader thread), never from the
+ * audio callback or get/set_param. */
+static void dlog(const char *fmt, ...)
+{
+    if (!g_host || !g_host->log) return;
+    char m[200];
+    int n = snprintf(m, sizeof m, "[audio-stream] ");
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(m + n, sizeof m - (size_t)n, fmt, ap);
+    va_end(ap);
+    g_host->log(m);
+}
 
 /* ------------------------------ helpers --------------------------------- */
 
@@ -153,7 +188,7 @@ static void client_close(inst_t *s, client_t *c)
 
 static void close_all(inst_t *s)
 {
-    for (int i = 0; i < MAX_CLIENTS; i++) client_close(s, &s->cl[i]);
+    for (int i = 0; i < MAX_SLOTS; i++) client_close(s, &s->cl[i]);
 }
 
 static size_t pending(const client_t *c) { return c->len - c->off; }
@@ -213,13 +248,9 @@ static void accept_clients(inst_t *s, int lfd, uint64_t now)
         int fd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK);
         if (fd < 0) return;
         int slot = -1;
-        for (int i = 0; i < MAX_CLIENTS; i++)
+        for (int i = 0; i < MAX_SLOTS; i++)
             if (s->cl[i].fd < 0) { slot = i; break; }
-        if (slot < 0) {
-            send_status_line(fd, "503 Busy");
-            close(fd);
-            continue;
-        }
+        if (slot < 0) { close(fd); continue; }          /* hopelessly busy: hard close */
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         client_t *c = &s->cl[slot];
@@ -275,6 +306,14 @@ static void client_read_request(inst_t *s, client_t *c, uint64_t now,
         client_close(s, c);
         return;
     }
+    if (atomic_load(&s->clients) >= MAX_STREAMS) {
+        /* The request has been read in full, so closing now is a clean FIN and
+         * the client can actually read this. */
+        send_status_line(c->fd, "503 Busy");
+        shutdown(c->fd, SHUT_WR);
+        client_close(s, c);
+        return;
+    }
     static const char http[] =
         "HTTP/1.0 200 OK\r\nContent-Type: audio/wav\r\n"
         "Cache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\n"
@@ -282,9 +321,39 @@ static void client_read_request(inst_t *s, client_t *c, uint64_t now,
     c->state = C_STREAM;
     c->t_progress = now;
     atomic_fetch_add(&s->clients, 1);
+    dlog("client connected (%d streaming)", atomic_load(&s->clients));
     client_queue(s, c, http, sizeof http - 1, limit);
     client_queue(s, c, wavhdr, 44, limit);
     c->hdr_total = c->len;
+}
+
+/* Listen on [::] with IPV6_V6ONLY=0 so both move.local over IPv6 and plain
+ * IPv4 work; fall back to IPv4-only if the kernel has no IPv6. */
+static int bind_one(int port, int *err_out)
+{
+    int one = 1, zero = 0;
+    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd >= 0) {
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+        struct sockaddr_in6 a6;
+        memset(&a6, 0, sizeof a6);
+        a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_any; a6.sin6_port = htons((uint16_t)port);
+        if (bind(fd, (struct sockaddr *)&a6, sizeof a6) == 0 && listen(fd, 4) == 0) return fd;
+        *err_out = errno;
+        close(fd);
+        if (*err_out != EAFNOSUPPORT && *err_out != EADDRNOTAVAIL) return -1;   /* e.g. EADDRINUSE */
+    }
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) { *err_out = errno; return -1; }
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a4;
+    memset(&a4, 0, sizeof a4);
+    a4.sin_family = AF_INET; a4.sin_addr.s_addr = htonl(INADDR_ANY); a4.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr *)&a4, sizeof a4) == 0 && listen(fd, 4) == 0) return fd;
+    *err_out = errno;
+    close(fd);
+    return -1;
 }
 
 static int try_bind(inst_t *s, int port, int *err_out)
@@ -292,43 +361,86 @@ static int try_bind(inst_t *s, int port, int *err_out)
     int span = s->port_span < 1 ? 1 : s->port_span;
     *err_out = 0;
     for (int p = port; p < port + span && p <= 65535; p++) {
-        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-        if (fd < 0) { *err_out = errno; return -1; }
-        int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        struct sockaddr_in a = { .sin_family = AF_INET,
-                                 .sin_addr.s_addr = htonl(INADDR_ANY),
-                                 .sin_port = htons((uint16_t)p) };
-        if (bind(fd, (struct sockaddr *)&a, sizeof a) == 0 && listen(fd, 4) == 0) {
-            atomic_store(&s->bound_port, p);
-            return fd;
-        }
-        *err_out = errno;
-        close(fd);
+        int fd = bind_one(p, err_out);
+        if (fd >= 0) { atomic_store(&s->bound_port, p); *err_out = 0; return fd; }
         if (*err_out != EADDRINUSE) return -1;
     }
     return -1;
 }
 
+/* ---- Move-mix tap (Schwung capture ring), read-only, worker thread only ---- */
+typedef struct {
+    const audio_live_shm_t *m;
+    uint64_t rd, last_wp, last_change, next_probe;
+} tap_t;
+
+static void tap_probe(tap_t *t, uint64_t now)
+{
+    if (t->m || now < t->next_probe) return;
+    t->next_probe = now + TAP_PROBE_MS;
+    int fd = open(AUDIO_LIVE_SHM_PATH, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    void *p = MAP_FAILED;
+    off_t size = lseek(fd, 0, SEEK_END);       /* not fstat: that needs GLIBC_2.33 */
+    if (size >= 0 && (size_t)size >= sizeof(audio_live_shm_t))
+        p = mmap(NULL, sizeof(audio_live_shm_t), PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return;
+    const audio_live_shm_t *m = p;
+    if (memcmp(m->magic, AUDIO_LIVE_MAGIC, sizeof(AUDIO_LIVE_MAGIC)) != 0 ||
+        m->version != AUDIO_LIVE_VERSION) {
+        munmap(p, sizeof(audio_live_shm_t));
+        return;
+    }
+    t->m = m;
+    t->last_wp = __atomic_load_n(&m->write_pos, __ATOMIC_ACQUIRE);
+    t->rd = t->last_wp;
+    t->last_change = now;
+    dlog("capture ring found (%s)", AUDIO_LIVE_SHM_PATH);
+}
+
+/* Track whether the shim is actually producing audio into the ring. */
+static int tap_fresh(tap_t *t, uint64_t now)
+{
+    if (!t->m) return 0;
+    uint64_t wp = __atomic_load_n(&t->m->write_pos, __ATOMIC_ACQUIRE);
+    if (wp != t->last_wp) { t->last_wp = wp; t->last_change = now; }
+    return now - t->last_change < TAP_FRESH_MS;
+}
+
+static void emit_chunk(inst_t *s, const int16_t *chunk, int nf, size_t limit)
+{
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        client_t *c = &s->cl[i];
+        if (c->fd >= 0 && c->state == C_STREAM)
+            client_queue(s, c, chunk, (size_t)nf * 4, limit);      /* LE host (aarch64) */
+    }
+}
+
 static void *worker(void *arg)
 {
     inst_t *s = arg;
-    /* Demote first and keep core 3 free for SPI (plugin_api_v1.h). */
+    /* Demote first (plugin_api_v1.h), keep core 3 free for SPI, and be nice:
+     * this thread must never compete with Move or Schwung Manager. */
     struct sched_param sp = { .sched_priority = 0 };
     sched_setscheduler(0, SCHED_OTHER, &sp);
     cpu_set_t set; CPU_ZERO(&set);
     CPU_SET(0, &set); CPU_SET(1, &set); CPU_SET(2, &set);
     sched_setaffinity(0, sizeof set, &set);
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
 
     uint8_t wavhdr[44];
     build_wav_header(wavhdr, s->sample_rate);
 
     int lfd = -1, bound_for_req = 0;
     uint64_t next_bind = 0;
+    tap_t tap = {0};
     int16_t chunk[CHUNK_FRAMES * 2];
-    struct pollfd pfd[MAX_CLIENTS + 1];
-    int pidx[MAX_CLIENTS + 1];
+    struct pollfd pfd[MAX_SLOTS + 1];
+    int pidx[MAX_SLOTS + 1];
+    int logged_bound = 0, logged_err = 0, logged_src = -1, logged_clients = 0;
 
+    dlog("worker started");
     while (!atomic_load(&s->quit)) {
         uint64_t now = now_ms();
         int low = atomic_load(&s->low_latency);
@@ -338,14 +450,16 @@ static void *worker(void *arg)
         if (!atomic_load(&s->enabled)) {
             /* Disabled: close the listener and every client, discard audio. */
             close_all(s);
-            if (lfd >= 0) { close(lfd); lfd = -1; atomic_store(&s->bound_port, 0); }
+            if (lfd >= 0) { close(lfd); lfd = -1; atomic_store(&s->bound_port, 0); dlog("disabled, listener closed"); logged_bound = 0; }
             atomic_store(&s->bind_err, 0);
+            atomic_store(&s->src_in_use, 0);
             s->rd = atomic_load(&s->wr);
-            poll(NULL, 0, 50);
+            poll(NULL, 0, DISABLED_POLL_MS);
             continue;
         }
 
         if (lfd >= 0 && want != bound_for_req) {         /* port changed: rebind */
+            dlog("port change %d -> %d, rebinding", bound_for_req, want);
             close_all(s);
             close(lfd); lfd = -1;
             atomic_store(&s->bound_port, 0);
@@ -357,10 +471,33 @@ static void *worker(void *arg)
             if (lfd >= 0) { bound_for_req = want; atomic_store(&s->bind_err, 0); }
             else { atomic_store(&s->bind_err, err ? err : EIO); next_bind = now + BIND_RETRY_MS; }
         }
+        {   /* log bind state changes only (never per retry) */
+            int bp = atomic_load(&s->bound_port), er = atomic_load(&s->bind_err);
+            if (bp != logged_bound && bp) dlog("listening on port %d (dual-stack)", bp);
+            if (er != logged_err && er) dlog("bind failed on port %d: errno %d%s", want, er, er == EADDRINUSE ? " (in use)" : "");
+            logged_bound = bp; logged_err = er;
+        }
+
+        /* Source selection + tap health. */
+        tap_probe(&tap, now);
+        int fresh = tap_fresh(&tap, now);
+        atomic_store(&s->tap_ok, fresh);
+        int mode = atomic_load(&s->source);
+        int src = (mode == 1) ? 1 : (mode == 2) ? (fresh ? 2 : 0) : (fresh ? 2 : 1);
+        if (src != atomic_load(&s->src_in_use)) {
+            atomic_store(&s->src_in_use, src);
+            s->rd = atomic_load(&s->wr);                     /* don't replay stale audio */
+            if (tap.m) tap.rd = __atomic_load_n(&tap.m->write_pos, __ATOMIC_ACQUIRE);
+        }
+        if (src != logged_src) {
+            dlog("source: %s", src == 2 ? "Move mix (capture ring)" : src == 1 ? "FX input" :
+                 "none - capture ring not live (enable display_mirror_enabled in features.json)");
+            logged_src = src;
+        }
 
         int n = 0;
         if (lfd >= 0) { pfd[n].fd = lfd; pfd[n].events = POLLIN; pidx[n] = -1; n++; }
-        for (int i = 0; i < MAX_CLIENTS; i++) {
+        for (int i = 0; i < MAX_SLOTS; i++) {
             client_t *c = &s->cl[i];
             if (c->fd < 0) continue;
             if (c->sndbuf_low != low) apply_sndbuf(c, low);
@@ -371,7 +508,10 @@ static void *worker(void *arg)
                           : (POLLIN | (pending(c) ? POLLOUT : 0));
             n++;
         }
-        poll(pfd, (nfds_t)n, 5);
+        /* Wake often only while someone is listening; otherwise sleep in poll
+         * until a connection arrives (or the idle timeout housekeeping). */
+        int streaming = atomic_load(&s->clients) > 0;
+        poll(pfd, (nfds_t)n, streaming ? 5 : IDLE_POLL_MS);
         now = now_ms();
 
         if (lfd >= 0) accept_clients(s, lfd, now);
@@ -384,34 +524,60 @@ static void *worker(void *arg)
             } else {                                   /* streaming: discard input, detect EOF */
                 uint8_t junk[256];
                 ssize_t r = recv(c->fd, junk, sizeof junk, 0);
-                if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+                if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
                     client_close(s, c);
+                    dlog("client disconnected (%d streaming)", atomic_load(&s->clients));
+                }
             }
         }
 
-        /* Drain the ring. Resync if the producer lapped us. */
+        streaming = atomic_load(&s->clients) > 0;
         uint64_t wr = atomic_load_explicit(&s->wr, memory_order_acquire);
-        if (wr - s->rd > RING_FRAMES) {
-            s->rd = wr - RING_FRAMES / 2;
-            atomic_fetch_add(&s->drops, 1);
-        }
-        while (s->rd < wr) {
-            uint64_t avail = wr - s->rd;
-            int nf = avail > CHUNK_FRAMES ? CHUNK_FRAMES : (int)avail;
-            for (int i = 0; i < nf; i++) {
-                size_t idx = (size_t)((s->rd + (uint64_t)i) & RING_MASK) * 2;
-                chunk[i * 2] = s->ring[idx];
-                chunk[i * 2 + 1] = s->ring[idx + 1];
+        if (!streaming || src == 0) {
+            /* Nobody to send to (or no source): stay at the live edge, copy nothing. */
+            s->rd = wr;
+            if (tap.m) tap.rd = tap.last_wp;
+        } else if (src == 1) {
+            if (wr - s->rd > RING_FRAMES) {                /* producer lapped us: resync */
+                s->rd = wr - RING_FRAMES / 2;
+                atomic_fetch_add(&s->drops, 1);
             }
-            s->rd += (uint64_t)nf;
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                client_t *c = &s->cl[i];
-                if (c->fd >= 0 && c->state == C_STREAM)
-                    client_queue(s, c, chunk, (size_t)nf * 4, limit);  /* LE host (aarch64) */
+            while (s->rd < wr) {
+                uint64_t avail = wr - s->rd;
+                int nf = avail > CHUNK_FRAMES ? CHUNK_FRAMES : (int)avail;
+                for (int i = 0; i < nf; i++) {
+                    size_t idx = (size_t)((s->rd + (uint64_t)i) & RING_MASK) * 2;
+                    chunk[i * 2] = s->ring[idx];
+                    chunk[i * 2 + 1] = s->ring[idx + 1];
+                }
+                s->rd += (uint64_t)nf;
+                emit_chunk(s, chunk, nf, limit);
+            }
+        } else {                                           /* src == 2: Schwung capture ring */
+            const audio_live_shm_t *m = tap.m;
+            uint64_t wp = tap.last_wp;
+            if (wp < tap.rd) tap.rd = wp;                  /* shim restarted */
+            if (wp - tap.rd > AUDIO_LIVE_FRAMES / 2) {     /* reader fell too far behind */
+                tap.rd = wp - AUDIO_LIVE_FRAMES / 4;
+                atomic_fetch_add(&s->drops, 1);
+            }
+            while (tap.rd < wp) {
+                uint64_t avail = wp - tap.rd;
+                int nf = avail > CHUNK_FRAMES ? CHUNK_FRAMES : (int)avail;
+                audio_live_read(m, tap.rd, tap.rd + (uint64_t)nf, chunk);
+                uint64_t lapped = audio_live_lapped(m, tap.rd);
+                tap.rd += (uint64_t)nf;
+                if (lapped) {                              /* writer overwrote the oldest frames */
+                    atomic_fetch_add(&s->drops, 1);
+                    if (lapped >= (uint64_t)nf) continue;
+                    memmove(chunk, chunk + lapped * 2, (size_t)(nf - (int)lapped) * 4);
+                    nf -= (int)lapped;
+                }
+                emit_chunk(s, chunk, nf, limit);
             }
         }
 
-        for (int i = 0; i < MAX_CLIENTS; i++) {
+        for (int i = 0; i < MAX_SLOTS; i++) {
             client_t *c = &s->cl[i];
             if (c->fd < 0) continue;
             if (c->state == C_REQUEST) {
@@ -422,13 +588,20 @@ static void *worker(void *arg)
                 continue;
             }
             client_flush(s, c, now);
-            if (c->fd < 0) continue;
+            if (c->fd < 0) { dlog("client dropped (send error)"); continue; }
             if (!pending(c)) c->t_progress = now;
-            else if (now - c->t_progress > (uint64_t)s->stall_ms) client_close(s, c);  /* stalled */
+            else if (now - c->t_progress > (uint64_t)s->stall_ms) {
+                client_close(s, c);                        /* stalled */
+                dlog("client evicted (stalled > %d ms)", s->stall_ms);
+            }
         }
+        int cn = atomic_load(&s->clients);
+        if (cn != logged_clients) logged_clients = cn;
     }
     close_all(s);
     if (lfd >= 0) close(lfd);
+    if (tap.m) munmap((void *)tap.m, sizeof(audio_live_shm_t));
+    dlog("worker stopped");
     return NULL;
 }
 
@@ -458,7 +631,8 @@ static void *create_instance(const char *module_dir, const char *config_json)
     s->sample_rate = (g_host && g_host->sample_rate > 0) ? g_host->sample_rate
                                                           : MOVE_SAMPLE_RATE;
     atomic_store(&s->enabled, 1);
-    for (int i = 0; i < MAX_CLIENTS; i++) s->cl[i].fd = -1;
+    dlog("instance created, port %d", atomic_load(&s->req_port));
+    for (int i = 0; i < MAX_SLOTS; i++) s->cl[i].fd = -1;
     if (pthread_create(&s->thr, NULL, worker, s) == 0) s->thr_started = 1;
     return s;
 }
@@ -498,18 +672,24 @@ static void set_param(void *inst, const char *key, const char *val)
     if (!strcmp(key, "enabled"))      atomic_store(&s->enabled, parse_enum01(val, "On"));
     else if (!strcmp(key, "latency")) atomic_store(&s->low_latency, parse_enum01(val, "Low"));
     else if (!strcmp(key, "port"))    atomic_store(&s->req_port, clamp_port(my_atoi(val)));
+    else if (!strcmp(key, "source")) {
+        int v = (!strcmp(val, "Mix") || !strcmp(val, "2")) ? 2
+              : (!strcmp(val, "FX in") || !strcmp(val, "1")) ? 1 : 0;
+        atomic_store(&s->source, v);
+    }
 }
 
 /* Parameter metadata. Enums use index-in/index-out. */
 #define PARAMS_JSON \
     "{\"key\":\"enabled\",\"name\":\"Stream\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"],\"default\":1}," \
+    "{\"key\":\"source\",\"name\":\"Source\",\"type\":\"enum\",\"options\":[\"Auto\",\"FX in\",\"Mix\"],\"default\":0}," \
     "{\"key\":\"latency\",\"name\":\"Latency\",\"type\":\"enum\",\"options\":[\"Normal\",\"Low\"],\"default\":0}," \
     "{\"key\":\"port\",\"name\":\"Port\",\"type\":\"int\",\"min\":1024,\"max\":65535,\"default\":8800}," \
     "{\"key\":\"status\",\"name\":\"Status\",\"type\":\"string\",\"access\":\"read\"}," \
     "{\"key\":\"clients\",\"name\":\"Clients\",\"type\":\"int\",\"min\":0,\"max\":4,\"access\":\"read\"}," \
     "{\"key\":\"drops\",\"name\":\"Drops\",\"type\":\"int\",\"min\":0,\"max\":999999,\"access\":\"read\"}"
 
-#define KNOBS_JSON "[\"enabled\",\"latency\",\"port\",\"status\",\"clients\",\"drops\"]"
+#define KNOBS_JSON "[\"enabled\",\"source\",\"latency\",\"port\",\"status\",\"clients\",\"drops\"]"
 
 static const char CHAIN_PARAMS[] = "[" PARAMS_JSON "]";
 static const char UI_HIERARCHY[] =
@@ -529,8 +709,9 @@ static int status_str(inst_t *s, char *buf, int buf_len)
     int bp = atomic_load(&s->bound_port), err = atomic_load(&s->bind_err);
     if (!atomic_load(&s->enabled)) return put(buf, buf_len, "OFF");
     if (bp) {
-        int c = atomic_load(&s->clients);
-        return snprintf(buf, (size_t)buf_len, ":%d %d client%s", bp, c, c == 1 ? "" : "s");
+        int c = atomic_load(&s->clients), src = atomic_load(&s->src_in_use);
+        const char *tag = src == 2 ? "MIX" : src == 1 ? "FX" : "NO MIX TAP";
+        return snprintf(buf, (size_t)buf_len, ":%d %d cl %s", bp, c, tag);
     }
     if (err == EADDRINUSE) return snprintf(buf, (size_t)buf_len, "PORT %d IN USE", atomic_load(&s->req_port));
     if (err) return snprintf(buf, (size_t)buf_len, "BIND ERR %d", err);
@@ -546,6 +727,8 @@ static int get_param(void *inst, const char *key, char *buf, int buf_len)
     if (!strcmp(key, "ui_hierarchy"))      return put(buf, buf_len, UI_HIERARCHY);
     if (!strcmp(key, "status"))            n = status_str(s, buf, buf_len);
     else if (!strcmp(key, "enabled"))      n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->enabled));
+    else if (!strcmp(key, "source"))       n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->source));
+    else if (!strcmp(key, "source_in_use")) n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->src_in_use));
     else if (!strcmp(key, "latency"))      n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->low_latency));
     else if (!strcmp(key, "port"))         n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->req_port));
     else if (!strcmp(key, "bound_port"))   n = snprintf(buf, (size_t)buf_len, "%d", atomic_load(&s->bound_port));

@@ -1,7 +1,7 @@
 {
     "id": "audio-stream",
     "name": "Audio Stream",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "abbrev": "STRM",
     "description": "Streams audio over WiFi as an HTTP WAV stream",
     "author": "richardfuller",

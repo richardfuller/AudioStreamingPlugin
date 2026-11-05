@@ -15,7 +15,9 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include "schwung/audio_fx_api_v2.h"
+#include "schwung/audio_live_shm.h"
 
 #define FAIL(...) do { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); exit(1); } while (0)
 #define CHECK(c, ...) do { if (!(c)) FAIL(__VA_ARGS__); } while (0)
@@ -207,6 +209,119 @@ static void test_rebind(void *inst, int port)
 }
 
 
+
+static void test_ipv6(int port)
+{
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) { puts("  skip IPv6 (no AF_INET6)"); return; }
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6; a.sin6_port = htons((uint16_t)port); inet_pton(AF_INET6, "::1", &a.sin6_addr);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a)) { close(fd); puts("  skip IPv6 (::1 unreachable here)"); return; }
+    sendreq(fd, "GET / HTTP/1.0\r\n\r\n");
+    uint8_t b[64]; size_t got = 0; slurp(fd, b, sizeof b - 1, 500, &got);
+    CHECK(got >= 15 && !strncmp((char *)b, "HTTP/1.0 200 OK", 15), "no 200 over IPv6");
+    close(fd);
+    PASS("listens on IPv6 (::1) as well as IPv4");
+}
+
+/* Writer thread-free fake of Schwung's shim: push one block per call. */
+static audio_live_shm_t *tap_create(void)
+{
+    int fd = open(AUDIO_LIVE_SHM_PATH, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    CHECK(fd >= 0 && !ftruncate(fd, sizeof(audio_live_shm_t)), "tap file");
+    audio_live_shm_t *m = mmap(NULL, sizeof *m, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    CHECK(m != MAP_FAILED, "tap mmap");
+    close(fd);
+    audio_live_init(m);
+    return m;
+}
+
+static double tph;
+static void tap_pump(audio_live_shm_t *m, void *inst, int blocks, int fx_too)
+{
+    int16_t blk[256];
+    for (int b = 0; b < blocks; b++) {
+        for (int i = 0; i < 128; i++) {                     /* tap signal: L == R */
+            int16_t v = (int16_t)(6000 * sin(tph)); tph += 2 * M_PI * 880 / 44100;
+            blk[i * 2] = v; blk[i * 2 + 1] = v;
+        }
+        if (m) audio_live_push(m, blk, 128, 1.0f);
+        if (fx_too) { int16_t f[256]; for (int i = 0; i < 128; i++) { f[i*2] = 100; f[i*2+1] = -100; } api->process_block(inst, f, 128); }
+        usleep(2900);
+    }
+}
+
+/* Classify what a stream carries: 'T' tap (L==R, ~6000), 'F' FX (L==-R). */
+static char classify(const uint8_t *rx, size_t got)
+{
+    const uint8_t *w = memmem(rx, got, "RIFF", 4);
+    if (!w || got < (size_t)(w - rx) + 44 + 4000) return '?';
+    const int16_t *pcm = (const int16_t *)(w + 44) + 1000;     /* skip start-up */
+    size_t nfr = (got - (size_t)((const uint8_t *)pcm - rx)) / 4;
+    int tap = 0, fx = 0;
+    for (size_t i = 0; i < nfr; i++) {
+        if (pcm[i*2] == pcm[i*2+1] && abs(pcm[i*2]) > 1000) tap++;
+        if (pcm[i*2] == 100 && pcm[i*2+1] == -100) fx++;
+    }
+    return tap > fx * 4 ? 'T' : fx > tap * 4 ? 'F' : '?';
+}
+
+/* One fresh connection per phase, so each capture starts at a WAV header. */
+static char capture_phase(void *inst, audio_live_shm_t *m, int blocks, int fx_too)
+{
+    int fd = dial(18950, 0);
+    CHECK(fd >= 0, "connect tap port");
+    sendreq(fd, "GET / HTTP/1.0\r\n\r\n");
+    static uint8_t rx[300000]; size_t got = 0;
+    for (int i = 0; i < blocks; i++) { tap_pump(m, inst, 1, fx_too); slurp(fd, rx, sizeof rx, 0, &got); }
+    close(fd);
+    return classify(rx, got);
+}
+
+static void test_tap_source(void)
+{
+    void *inst = api->create_instance(".", "{\"port\": 18950}");
+    usleep(200000);
+    char st[64];
+
+    /* 1. No capture ring: Auto falls back to the FX input. */
+    char c = capture_phase(inst, NULL, 400, 1);
+    status(inst, st, sizeof st);
+    CHECK(c == 'F' && strstr(st, " FX"), "no-tap fallback: %c '%s'", c, st);
+    PASS("Auto falls back to FX input when no capture ring exists");
+
+    /* 2. Ring appears and advances: Auto switches to the Move mix. */
+    audio_live_shm_t *m = tap_create();
+    for (int i = 0; i < 1000; i++) tap_pump(m, inst, 1, 1);          /* let the 2 s probe find it */
+    status(inst, st, sizeof st);
+    CHECK(strstr(st, "MIX"), "did not switch to tap: '%s'", st);
+    c = capture_phase(inst, m, 400, 1);
+    CHECK(c == 'T', "stream is not the tap signal (%c)", c);
+    PASS("Auto switches to Move mix tap once the ring is live (aligned, gapless)");
+
+    /* 3. Forced FX input. */
+    api->set_param(inst, "source", "1");
+    usleep(100000);
+    c = capture_phase(inst, m, 400, 1);
+    CHECK(c == 'F', "FX input not selected (%c)", c);
+    PASS("source=FX in forces the slot audio even while the tap is live");
+
+    /* 4. Forced Mix, ring goes silent: reports NO MIX TAP. */
+    api->set_param(inst, "source", "2");
+    for (int i = 0; i < 400; i++) tap_pump(NULL, inst, 1, 1);        /* ring stops advancing */
+    status(inst, st, sizeof st);
+    CHECK(strstr(st, "NO MIX TAP") || !strstr(st, "MIX "), "status '%s'", st);
+    int fd = dial(18950, 0); sendreq(fd, "GET / HTTP/1.0\r\n\r\n");
+    for (int i = 0; i < 100; i++) tap_pump(NULL, inst, 1, 1);
+    status(inst, st, sizeof st);
+    CHECK(strstr(st, "NO MIX TAP"), "status '%s'", st);
+    close(fd);
+    PASS("source=Mix with a dead ring says NO MIX TAP");
+    api->destroy_instance(inst);
+    munmap(m, sizeof *m);
+    unlink(AUDIO_LIVE_SHM_PATH);
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc > 1, "usage: host_test <plugin.so>");
@@ -228,13 +343,17 @@ int main(int argc, char **argv)
     CHECK(n > 100 && strstr(big, "\"levels\"") && strstr(big, "\"knobs\""), "ui_hierarchy");
     PASS("chain_params + ui_hierarchy served");
 
+    unlink(AUDIO_LIVE_SHM_PATH);
     test_stream_and_passthrough(inst, 18800);
+    test_ipv6(18800);
     test_request_parsing(inst, 18800);
     test_busy_503(inst, 18800);
     test_stall_eviction_and_drops(inst, 18800);
     test_silent_request_timeout(inst, 18800);
     test_disable_closes_clients(inst, 18800);
     test_rebind(inst, 18800);
+
+    test_tap_source();
 
     /* Port conflicts: a squatter on 18900. */
     int sq = socket(AF_INET, SOCK_STREAM, 0), one = 1;
